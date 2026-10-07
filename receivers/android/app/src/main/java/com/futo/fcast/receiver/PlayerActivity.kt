@@ -173,6 +173,23 @@ class PlayerActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.i(TAG, "onCreate")
+
+        // Waking the display is all an app can do about a TV that is off: the
+        // CEC half is the platform's. Android TV playback devices run One Touch
+        // Play (<Text View On> + <Active Source>) on any wake, which turns the
+        // TV on and switches its input - the same mechanism the Chromecast uses.
+        // The manifest attributes cover API 27+, this covers the rest.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                        or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+            )
+        }
+
         initializeExoPlayer()
 
         setContent {
@@ -220,6 +237,7 @@ class PlayerActivity : AppCompatActivity() {
                 else -> {}
             }
             viewModel.source = null
+            updateKeepScreenOnFlag()
         } catch (e: Exception) {
             Log.e(TAG, "WHEP client failed to disconnect: $e")
         }
@@ -228,6 +246,14 @@ class PlayerActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         Log.i(TAG, "onDestroy")
+
+        // `finish()` is not the only way out: the system destroys the activity on
+        // its own as well (resource pressure, the screen saver taking over). A
+        // stale `instance` makes NetworkService hand the next cast to a dead
+        // window, which is why casting then only works after a force-close.
+        if (instance === this) {
+            instance = null
+        }
 
         _mediaSession.release()
         _exoPlayer.removeListener(_playerEventListener)
@@ -787,7 +813,14 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     fun updateKeepScreenOnFlag() {
-        if (_exoPlayer.playWhenReady && (_exoPlayer.playbackState == Player.STATE_READY || _exoPlayer.playbackState == Player.STATE_BUFFERING)) {
+        // Mirroring renders a WebRTC track and never touches ExoPlayer, so the
+        // player state says nothing about it. Without the first condition the
+        // screen saver takes over in the middle of a cast.
+        val isMirroring = viewModel.source is PlayerSource.Whep
+        val isPlaying = _exoPlayer.playWhenReady
+                && (_exoPlayer.playbackState == Player.STATE_READY || _exoPlayer.playbackState == Player.STATE_BUFFERING)
+
+        if (isMirroring || isPlaying) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -956,6 +989,7 @@ class PlayerActivity : AppCompatActivity() {
             viewModel.errorMessage = null
             viewModel.hasDuration = false
             _wasPlaying = false
+            updateKeepScreenOnFlag()
 
             sendPlaybackUpdate()
             onMediaLoad(message, 0)

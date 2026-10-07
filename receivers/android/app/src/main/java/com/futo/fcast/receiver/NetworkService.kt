@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
@@ -228,50 +229,95 @@ class NetworkService : Service() {
 
                 _scope.launch(Dispatchers.Main) {
                     try {
-                        if (PlayerActivity.instance == null) {
+                        // `instance` only gets cleared when the activity goes away
+                        // through finish(); a system-destroyed one would still be
+                        // here and would swallow the play message.
+                        val player = PlayerActivity.instance
+                            ?.takeIf { !it.isDestroyed && !it.isFinishing }
+
+                        if (player == null) {
                             Log.i(TAG, "Launching player activity with play message: $playMessage")
-                            val i = Intent(this@NetworkService, PlayerActivity::class.java)
-                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-
-                            if (activityCount > 0) {
-                                startActivity(i)
-                            } else if (Settings.canDrawOverlays(this@NetworkService)) {
-                                val pi = PendingIntent.getActivity(
-                                    this@NetworkService,
-                                    0,
-                                    i,
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                )
-                                pi.send()
-                            } else {
-                                val pi = PendingIntent.getActivity(
-                                    this@NetworkService,
-                                    0,
-                                    i,
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                )
-                                val playNotification = createNotificationBuilder()
-                                    .setContentTitle("FCast")
-                                    .setContentText("New content received. Tap to play.")
-                                    .setSmallIcon(R.drawable.ic_stat_name)
-                                    .setContentIntent(pi)
-                                    .setPriority(NotificationCompat.PRIORITY_HIGH)
-                                    .setAutoCancel(true)
-                                    .build()
-
-                                val notificationManager =
-                                    getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-                                notificationManager.notify(PLAY_NOTIFICATION_ID, playNotification)
-                            }
+                            // onCreate picks the message up from the cache.
+                            showPlayerActivity()
                         } else {
                             Log.i(TAG, "Reusing player activity with play message: $playMessage")
-                            PlayerActivity.instance?.play(cache.playMessage!!)
+                            // The activity can be alive but backgrounded (home
+                            // screen, screen saver), where the cast would play into
+                            // a window nobody sees. PlayerActivity is
+                            // singleInstance, so this brings the existing one
+                            // forward rather than creating a second.
+                            showPlayerActivity()
+                            player.play(cache.playMessage!!)
                         }
                     } catch (e: Throwable) {
                         Log.e(TAG, "Failed to play", e)
                     }
                 }
             }
+        }
+    }
+
+    /// Nudges a sleeping device awake so that the player's `turnScreenOn` has
+    /// something to act on, which in turn makes the platform send CEC One Touch
+    /// Play to the TV. Deprecated API with no public replacement for this, and
+    /// newer Android versions may refuse it, so failure is not fatal.
+    private fun wakeUpDisplay() {
+        try {
+            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+            if (powerManager.isInteractive) {
+                return
+            }
+
+            Log.i(TAG, "Device is asleep, waking the display for the incoming cast")
+            @Suppress("DEPRECATION")
+            val wakeLock = powerManager.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "fcast:wake-for-cast"
+            )
+            // The player's own FLAG_KEEP_SCREEN_ON takes over from here.
+            wakeLock.acquire(3000)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to wake the display", e)
+        }
+    }
+
+    /// Brings the player to the front, or asks the user to tap a notification
+    /// when the system does not let a background app start an activity.
+    private fun showPlayerActivity() {
+        wakeUpDisplay()
+
+        val i = Intent(this, PlayerActivity::class.java)
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        if (activityCount > 0) {
+            startActivity(i)
+        } else if (Settings.canDrawOverlays(this)) {
+            val pi = PendingIntent.getActivity(
+                this,
+                0,
+                i,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            pi.send()
+        } else {
+            val pi = PendingIntent.getActivity(
+                this,
+                0,
+                i,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val playNotification = createNotificationBuilder()
+                .setContentTitle("FCast")
+                .setContentText("New content received. Tap to play.")
+                .setSmallIcon(R.drawable.ic_stat_name)
+                .setContentIntent(pi)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .build()
+
+            val notificationManager =
+                getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.notify(PLAY_NOTIFICATION_ID, playNotification)
         }
     }
 
